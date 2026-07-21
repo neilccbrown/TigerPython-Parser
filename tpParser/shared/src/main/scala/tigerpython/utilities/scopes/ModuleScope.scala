@@ -28,6 +28,16 @@ class ModuleScope(sourceLength: Int, val module: Package, val moduleLoader: Modu
   val inferableFunctionDefs: collection.mutable.ArrayBuffer[ModuleScope.InferableFunctionRecord] =
     collection.mutable.ArrayBuffer()
 
+  // Function stubs pre-registered by AstWalker.preRegisterModuleFunctions before the
+  // module is walked for real, so a top-level function can call a sibling defined
+  // later in the module from inside its own body (deferred execution - by the time
+  // the call actually runs, the whole module has finished defining everything, same
+  // as ClassScope.preRegisteredMethodStubs but one level up). Looked up by
+  // AstWalker.walkFunction to migrate any call-site evidence recorded against the stub
+  // onto the real PythonFunction once that function's def is actually reached.
+  val preRegisteredFunctionStubs: java.util.IdentityHashMap[AstNode.FunctionDef, PythonFunction] =
+    new java.util.IdentityHashMap()
+
   override def getModule: ModuleScope = this
 
   def define(name: String, dataType: DataType): Unit =

@@ -31,5 +31,11 @@ class NameMap() {
         map(key) = value
     }
 
+  // Plain overwrite, bypassing update's merge-on-reassignment: needed when replacing a
+  // pre-registered stub with the real object it stands in for, where the two are
+  // never `==` (distinct object identity) but aren't a genuine type-widening case.
+  def forceSet(key: String, value: DataType): Unit =
+    map(key) = value
+
   def ++=(xs : Map[String, DataType]) = map ++= xs
 }

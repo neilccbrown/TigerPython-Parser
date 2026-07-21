@@ -1,7 +1,8 @@
 package tigerpython.utilities
 package scopes
 
-import types.{DataType, PythonClass}
+import tigerpython.parser.ast.AstNode
+import types.{DataType, PythonClass, PythonFunction}
 
 /**
   * @author Tobias Kohn
@@ -10,6 +11,14 @@ import types.{DataType, PythonClass}
   * Updated by Tobias Kohn on 01.07.2016.
   */
 class ClassScope(val startPos: Int, val endPos: Int, val pyClass: PythonClass) extends Scope {
+
+  // Method stubs pre-registered by AstWalker.walkClass before any of the class's own
+  // method bodies are walked, so a method can call an as-yet-unwalked sibling defined
+  // later in the same class body (self.use(1) where use appears below). Looked up by
+  // AstWalker.walkFunction to migrate any call-site evidence recorded against the stub
+  // onto the real PythonFunction once that method's def is actually reached.
+  val preRegisteredMethodStubs: java.util.IdentityHashMap[AstNode.FunctionDef, PythonFunction] =
+    new java.util.IdentityHashMap()
 
   def define(name: String, dataType: DataType): Unit =
     pyClass.setField(name, dataType)

@@ -239,8 +239,95 @@ class AstWalker(val scope: Scope) {
     scope.addScope(classScope)
     result.source = classScope.getCurrentPath
     result.sourcePos = cls.pos
+    // Pre-register every method's stub before walking any method body, so a method
+    // can call a sibling defined later in this same class body (self.use(1) where use
+    // appears below) - methods are only ever invoked after the whole class body has
+    // finished executing, so definition order within the class doesn't matter for the
+    // calling convention, only for straight-line reads of the class's own statements.
+    for (stmt <- statementsOf(cls.body))
+      stmt match {
+        case methodDef: AstNode.FunctionDef =>
+          val stub = buildMethodStub(methodDef, result)
+          if (methodDef.hasDecorator("classmethod", "staticmethod"))
+            result.setField(stub.name, stub)
+          result.setInstanceField(stub.name, stub)
+          classScope.preRegisteredMethodStubs.put(methodDef, stub)
+        case _ =>
+      }
     val walker = new AstWalker(classScope)
     walker.walkNode(cls.body)
+  }
+
+  // Extracts the immediate statements of a function/class body, regardless of whether
+  // it was parsed as a multi-statement Suite or left as a single bare statement.
+  private def statementsOf(body: AstNode.Statement): Array[AstNode.Statement] =
+    body match {
+      case null => Array()
+      case suite: AstNode.Suite => suite.statements
+      case other => Array(other)
+    }
+
+  // Builds a structurally-correct (same count/order/names as getParameters would
+  // produce) but untyped (all ANY_TYPE) parameter array for a stub PythonFunction.
+  // Real annotation/default types aren't evaluated here - they'd need a properly
+  // scoped type walk, and are filled in anyway, in place, once the real def is walked.
+  private def buildStubParams(params: AstNode.Parameters): Array[Parameter] =
+    if (params != null && params.args != null) {
+      val result = collection.mutable.ArrayBuffer[Parameter]()
+      for (arg <- params.args)
+        arg match {
+          case AstNode.NameParameter(_, name, _) =>
+            result += Parameter(name, ANY_TYPE)
+          case _ =>
+        }
+      if (params.varArgs != null)
+        result += Parameter(params.varArgs.name, BuiltinTypes.TUPLE_TYPE)
+      if (params.kwArgs != null)
+        result += Parameter(params.kwArgs.name, BuiltinTypes.DICT_TYPE)
+      result.toArray
+    } else
+      Array()
+
+  private def buildMethodStub(function: AstNode.FunctionDef, pyClass: PythonClass): PythonFunction = {
+    val params = buildStubParams(function.params)
+    if (params.nonEmpty && !function.hasDecorator("staticmethod"))
+      params(0).dataType =
+        if (function.hasDecorator("classmethod")) new SelfClass(pyClass) else new SelfInstance(pyClass)
+    new PythonFunction(function.name.name, params,
+      function.params.maxPositionalArgCount min params.length, null, ANY_TYPE)
+  }
+
+  // Pre-registers a stub for every top-level function in the module suite before the
+  // module is walked for real, so a top-level function can call a sibling defined
+  // later in the module from inside its own body - by the time that call actually
+  // runs (the enclosing function has to be called first), the whole module has
+  // finished defining everything, so this is ordinary, valid Python, unlike a bare
+  // top-level call to a not-yet-defined function (a genuine NameError at runtime,
+  // which is intentionally left unsupported).
+  def preRegisterModuleFunctions(moduleScope: ModuleScope, moduleBody: AstNode): Unit =
+    moduleBody match {
+      case suite: AstNode.Statement =>
+        for (stmt <- statementsOf(suite))
+          stmt match {
+            case funcDef: AstNode.FunctionDef =>
+              val params = buildStubParams(funcDef.params)
+              val stub = new PythonFunction(funcDef.name.name, params,
+                funcDef.params.maxPositionalArgCount min params.length, null, ANY_TYPE)
+              moduleScope.module.setField(stub.name, stub)
+              moduleScope.preRegisteredFunctionStubs.put(funcDef, stub)
+            case _ =>
+          }
+      case _ =>
+    }
+
+  // Copies any call-site evidence recorded against a pre-registered stub (from a
+  // sibling/caller walked before this def was reached) onto the real PythonFunction,
+  // positionally - the two params arrays are guaranteed the same shape, since both are
+  // derived from the same AST Parameters node via the same structural logic.
+  private def copyCallSiteEvidence(stub: PythonFunction, result: PythonFunction): Unit = {
+    val n = math.min(stub.paramCallEvidence.length, result.paramCallEvidence.length)
+    for (i <- 0 until n)
+      result.paramCallEvidence(i) = stub.paramCallEvidence(i)
   }
 
   protected def walkFunction(function: AstNode.FunctionDef): Unit = {
@@ -267,13 +354,39 @@ class AstWalker(val scope: Scope) {
     val result = new PythonFunction(function.name.name, params,
       function.params.maxPositionalArgCount min params.length, getSignature(function.params, ANY_TYPE, firstParamIsSelfOrCls), ANY_TYPE)
     result.docString = function.docString
+    // If a sibling/caller walked earlier (before this def was reached) already recorded
+    // call-site evidence against a pre-registered stub for this exact def, migrate it
+    // onto the real PythonFunction now, before pass 2 (reinferParamsFromCallSites) reads
+    // it - and register the real object via the "overwrite" path (see NameMap.forceSet),
+    // since a plain setField/setInstanceField would merge the stub and the real object
+    // as if this were a type-widening reassignment, collapsing straight to ANY_TYPE.
+    var hadStub = false
+    scope match {
+      case mod: ModuleScope =>
+        val stub = mod.preRegisteredFunctionStubs.get(function)
+        if (stub != null) {
+          hadStub = true
+          copyCallSiteEvidence(stub, result)
+        }
+      case cls: ClassScope =>
+        val stub = cls.preRegisteredMethodStubs.get(function)
+        if (stub != null) {
+          hadStub = true
+          copyCallSiteEvidence(stub, result)
+        }
+      case _ =>
+    }
     scope match {
       case cls: ClassScope =>
-        if (function.hasDecorator("classmethod", "staticmethod"))
-          cls.pyClass.setField(result.name, result)
-        cls.pyClass.setInstanceField(result.name, result)
+        if (function.hasDecorator("classmethod", "staticmethod")) {
+          if (hadStub) cls.pyClass.overwriteField(result.name, result) else cls.pyClass.setField(result.name, result)
+        }
+        if (hadStub) cls.pyClass.overwriteInstanceField(result.name, result) else cls.pyClass.setInstanceField(result.name, result)
       case mod: ModuleScope =>
-        mod.module.setField(result.name, result)
+        (mod.module, hadStub) match {
+          case (m: Module, true) => m.overwriteField(result.name, result)
+          case _ => mod.module.setField(result.name, result)
+        }
       case _ =>
     }
     val functionScope = new FunctionScope(function.pos, function.endPos, result)

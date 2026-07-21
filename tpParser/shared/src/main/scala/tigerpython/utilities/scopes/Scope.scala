@@ -220,6 +220,7 @@ object Scope {
     val moduleScope = new ModuleScope(-1, module, moduleLoader)
     if (ast != null) {
       val walker = new AstWalker(moduleScope)
+      walker.preRegisterModuleFunctions(moduleScope, ast)
       walker.walkNode(ast)
       if (moduleScope.inferableFunctionDefs.nonEmpty)
         walker.reinferParamsFromCallSites(moduleScope)

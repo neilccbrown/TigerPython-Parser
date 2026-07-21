@@ -16,4 +16,9 @@ class Module(val name: String) extends Package {
 
   def setField(name: String, dataType: DataType): Unit =
     fields(name) = dataType
+
+  // See PythonClass.overwriteField - replaces a pre-registered stub with the real
+  // object without tripping NameMap.update's merge-on-reassignment logic.
+  def overwriteField(name: String, dataType: DataType): Unit =
+    fields.forceSet(name, dataType)
 }
